@@ -134,6 +134,210 @@ function L0_reg(
 
     #convert bitarrays to Float64 genotype matrix, standardize each SNP, and add intercept
     snpmatrix = convert(Array{Float64,2}, x.snpmatrix)
+
+
+    # snpmatrix = use_A2_as_minor_allele(x.snpmatrix) #to compare results with using PLINK
+    snpmatrix = StatsBase.zscore(snpmatrix, 1)  # standardize
+    #snpmatrix = StandardizedMatrix(snpmatrix)  # NEW WAY !!! doesn't work all the way
+    println("Gordon testing 130,510: Set Intercept here or NOT, and in MendelIHT_utilities.jl")
+    println("Note: Set USE_INTERCEPT = false to drop intercept column.")
+    USE_INTERCEPT = true
+    if USE_INTERCEPT
+        snpmatrix = [ones(size(snpmatrix, 1)) snpmatrix]
+    end
+    println("Note: Set USE_WEIGHTS = true to use weights.")
+    USE_WEIGHTS = true
+    if USE_WEIGHTS
+        #copy!(snpmatrix, my_snpmatrix)  # NEW WAY with WEIGHTS !!!
+        my_snpweights, snpmatrix = calculatePriorWeightsforIHT(x,y,k,v)
+    end
+    println()
+    println("Gordon 130: size(snpmatrix) = $(size(snpmatrix))")
+    println("Gordon 130: contents of snpmatrix after zscore()")
+    println(snpmatrix[1,1:10])
+    println(snpmatrix[2,1:10])
+    println(snpmatrix[3,1:10])
+    println("\n")
+    #
+    # Begin IHT calculations
+    #
+    fill!(v.xb, 0.0) #initialize β = 0 vector, so Xβ = 0
+    println("Gordon 134: size(v.xb) = $(size(v.xb))")
+    copy!(v.r, y)    #redisual = y-Xβ = y  CONSIDER BLASCOPY!
+    v.r[mask_n .== 0] .= 0 #bit masking? idk why we need this yet
+    println("Gordon 137: size(v.r) = $(size(v.r))")
+
+    # calculate the gradient v.df = -X'(y - Xβ) = X'(-1*(Y-Xb)). Future gradient
+    # calculations are done in iht!. Note the negative sign will be cancelled afterwards
+    # when we do b+ = P_k( b - μ∇f(b)) = P_k( b + μ(-∇f(b))) = P_k( b + μ*v.df)
+
+    # Can we use v.xk instead of snpmatrix?
+    println(size(v.df), size(snpmatrix), size(v.r))
+    print("Gordon 143: size(v.df), size(snpmatrix), size(v.r) = ")
+    At_mul_B!(v.df, snpmatrix, v.r)
+
+    tic()   # duplicate clock here to skip timing debug statements in weight function
+
+    for mm_iter = 1:max_iter
+        println()
+        print_with_color(:red,"=========== mm_iter LOOP ==========================================================\n")
+        println("Gordon 145: mm_iter = $mm_iter")
+        # save values from previous iterate
+        copy!(v.b0, v.b)   # b0 = b   CONSIDER BLASCOPY!
+        copy!(v.xb0, v.xb) # Xb0 = Xb  CONSIDER BLASCOPY!
+        loss = next_loss
+
+        #calculate the step size μ. Can we use v.xk instead of snpmatrix?
+        println("Gordon 153: size(y) = $(size(y))")
+        print_with_color(:red,"Gordon 153:, k = $k\n")
+        (μ, μ_step) = iht!(v, snpmatrix, y, k, nstep=max_step, iter=mm_iter)
+
+        # iht! gives us an updated x*b. Use it to recompute residuals and gradient
+        v.r .= y .- v.xb
+        v.r[mask_n .== 0] .= 0 #bit masking, idk why we need this yet
+
+        At_mul_B!(v.df, snpmatrix, v.r) # v.df = X'(y - Xβ) Can we use v.xk instead of snpmatrix?
+        print("Gordon 159: size(v.df), size(snpmatrix), size(v.r) = ")
+        println(size(v.df), size(snpmatrix), size(v.r))
+
+        # update loss, objective, gradient, and check objective is not NaN or Inf
+        next_loss = sum(abs2, v.r) / 2
+        !isnan(next_loss) || throw(error("Objective function is NaN, aborting..."))
+        !isinf(next_loss) || throw(error("Objective function is Inf, aborting..."))
+
+        # track convergence
+        the_norm    = chebyshev(v.b, v.b0) #max(abs(x - y))
+        print("Gordon 167: size(v.b), size(v.b0) = ")
+        println(size(v.b), size(v.b0))
+        scaled_norm = the_norm / (norm(v.b0, Inf) + 1)
+        converged   = scaled_norm < tol
+
+        if converged
+            mm_time = toq()   # stop time
+            #PyPlot.boxplot(rand(100,6))
+
+            println("IHT converged in " * string(mm_iter) * " iterations")
+            println("It took " * string(mm_time) * " seconds to converge")
+            println("The estimated model is stored in 'beta'")
+            println("There are " * string(countnz(v.b)) * " non-zero entries of β")
+            found = find(v.b .!= 0.0)
+            println(found)
+            println(v.b[found])
+            return IHTResults(mm_time, next_loss, mm_iter, copy(v.b))
+        end
+
+        if mm_iter == max_iter
+            mm_time = toq() # stop time
+            throw(error("Did not converge!!!!! The run time for IHT was " *
+                string(mm_time) * "seconds"))
+        end
+        print_with_color(:red,"=========== mm_iter LOOP END ====\n")
+    end
+end #function L0_reg
+
+"""
+Calculates the IHT step β+ = P_k(β - μ ∇f(β)).
+Returns step size (μ), and number of times line search was done (μ_step).
+
+This function updates: b, xb, xk, gk, xgk, idx
+"""
+function iht!(
+    v         :: IHTVariable,
+    snpmatrix :: Matrix{Float64},
+    y         :: Vector{Float64},
+    k         :: Int;
+    iter      :: Int = 1,
+    nstep     :: Int = 50,
+)
+    println()
+    print_with_color(:green,"=========== BEGIN iht!() ==============================\n")
+    println("Gordon 202: BEGIN iht!()")
+    # compute indices of nonzeroes in beta and store them in v.idx (also sets size of v.gk)
+    _iht_indices(v, k)
+
+    # fill v.xk, which stores columns of snpmatrix corresponding to non-0's of b
+    println("Gordon 206: ready to broadcast???")
+    v.xk[:, :] .= snpmatrix[:, v.idx]
+    print("Gordon 207: size(v.xk), size(snpmatrix), size(v.idx) = ")
+    println(size(v.xk), size(snpmatrix), size(v.idx))
+
+    # fill v.gk, which store only k largest components of gradient (v.df)
+    # fill_perm!(v.gk, v.df, v.idx)  # gk = g[v.idx]
+    v.gk .= v.df[v.idx]
+    println("Gordon 211: size(v.gk) = $(size(v.gk))")
+
+    # now compute X_k β_k and store result in v.xgk
+    A_mul_B!(v.xgk, v.xk, v.gk)
+    print("Gordon 214: size(v.xgk), size(v.xk), size(v.gk) = ")
+    println(size(v.xgk), size(v.xk), size(v.gk))
+
+    # warn if xgk only contains zeros
+    all(v.xgk .≈ 0.0) && warn("Entire active set has values equal to 0")
+
+    #compute step size and notify if step size too small
+    μ = norm(v.gk, 2)^2 / norm(v.xgk, 2)^2
+    isfinite(μ) || throw(error("Step size is not finite, is active set all zero?"))
+    μ <= eps(typeof(μ)) && warn("Step size $(μ) is below machine precision, algorithm may not converge correctly")
+    println("Gordon 222: before _iht_gradstep, μ = $μ")
+
+    #Take the gradient step and compute ω. Note in order to compute ω, need β^{m+1} and xβ^{m+1} (eq5)
+    _iht_gradstep(v, μ, k)
+    #ω = compute_ω!(v, snpmatrix) #is snpmatrix required? Or can I just use v.x
+    #these next 5 lines temporarily replace the previous line's call to compute_ω()
+        A_mul_B!(v.xb, snpmatrix, v.b)
+        print("Gordon 224: size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0) = ")
+        println(size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0))
+        ω = sqeuclidean(v.b, v.b0) / sqeuclidean(v.xb, v.xb0)
+        println("Gordon 224: ω = $ω")
+    println("Gordon 226: after  _iht_gradstep and compute_ω!(), ω = $ω")
+
+    #compute ω and check if μ < ω. If not, do line search by halving μ and checking again.
+    μ_step = 0
+    for i = 1:nstep
+        #exit loop if μ < ω where c = 0.01 for now
+        if _iht_backtrack(v, ω, μ); break; end
+        println()
+        println("=========== BEGIN BACKTRACK LOOP (i = $i) ===============")
+        #println("Gordon 232: after _iht_backtrack(), i = $i")
+
+        #if μ >= ω, step half and warn if μ falls below machine epsilon
+        μ /= 2
+        μ <= eps(typeof(μ)) && warn("Step size equals zero, algorithm may not converge correctly")
+        println("Gordon 236: μ = $μ")
+
+        # recompute gradient step
+        copy!(v.b, v.b0)
+        _iht_gradstep(v, μ, k)
+
+        # re-compute ω based on xβ^{m+1}
+        A_mul_B!(v.xb, snpmatrix, v.b)
+        #print("Gordon 244: size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0) = ")
+        #println(size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0))
+        ω = sqeuclidean(v.b, v.b0) / sqeuclidean(v.xb, v.xb0)
+        println("Gordon 244: ω = $ω")
+
+
+        μ_step += 1
+        println("=========== END BACKTRACK LOOP =====")
+    end
+    print_with_color(:green,"=========== END iht!() =====\n")
+    return (μ, μ_step)
+end
+"""
+Calculates the Prior Weighting for IHT.
+Returns a weight matrix (snpweights)
+    and a weighted SNP matrix (snpmatrix).
+
+This function updates: hopefully nothing???
+"""
+function calculatePriorWeightsforIHT(
+    x        :: SnpData,
+    y        :: Vector{Float64},
+    k        :: Int,
+    v        :: IHTVariable
+)
+    #convert bitarrays to Float64 genotype matrix, standardize each SNP, and add intercept
+    snpmatrix = convert(Array{Float64,2}, x.snpmatrix)
     println("===============================================================")
     println("============= BEGIN CODE FOR PRIOR WEIGHTS FUNCTION ===========")
     println("===============================================================")
@@ -599,187 +803,5 @@ function L0_reg(
     println("===============================================================")
     println("===============================================================")
     println("===============================================================")
-
-    # snpmatrix = use_A2_as_minor_allele(x.snpmatrix) #to compare results with using PLINK
-    snpmatrix = StatsBase.zscore(snpmatrix, 1)  # standardize
-    #snpmatrix = StandardizedMatrix(snpmatrix)  # NEW WAY !!! doesn't work all the way
-    println("Gordon testing 130,510: Set Intercept here or NOT, and in MendelIHT_utilities.jl")
-    if USE_INTERCEPT
-        snpmatrix = [ones(size(snpmatrix, 1)) snpmatrix]
-    end
-
-    if USE_WEIGHTS
-        copy!(snpmatrix, my_snpmatrix)  # NEW WAY with WEIGHTS !!!
-    end
-    println()
-    println("Gordon 130: size(snpmatrix) = $(size(snpmatrix))")
-    println("Gordon 130: contents of snpmatrix after zscore()")
-    println(snpmatrix[1,1:10])
-    println(snpmatrix[2,1:10])
-    println(snpmatrix[3,1:10])
-    println("\n")
-    #
-    # Begin IHT calculations
-    #
-    fill!(v.xb, 0.0) #initialize β = 0 vector, so Xβ = 0
-    println("Gordon 134: size(v.xb) = $(size(v.xb))")
-    copy!(v.r, y)    #redisual = y-Xβ = y  CONSIDER BLASCOPY!
-    v.r[mask_n .== 0] .= 0 #bit masking? idk why we need this yet
-    println("Gordon 137: size(v.r) = $(size(v.r))")
-
-    # calculate the gradient v.df = -X'(y - Xβ) = X'(-1*(Y-Xb)). Future gradient
-    # calculations are done in iht!. Note the negative sign will be cancelled afterwards
-    # when we do b+ = P_k( b - μ∇f(b)) = P_k( b + μ(-∇f(b))) = P_k( b + μ*v.df)
-
-    # Can we use v.xk instead of snpmatrix?
-    println(size(v.df), size(snpmatrix), size(v.r))
-    print("Gordon 143: size(v.df), size(snpmatrix), size(v.r) = ")
-    At_mul_B!(v.df, snpmatrix, v.r)
-
-    tic()   # duplicate clock here to skip timing debug statements in weight function
-
-    for mm_iter = 1:max_iter
-        println()
-        print_with_color(:red,"=========== mm_iter LOOP ==========================================================\n")
-        println("Gordon 145: mm_iter = $mm_iter")
-        # save values from previous iterate
-        copy!(v.b0, v.b)   # b0 = b   CONSIDER BLASCOPY!
-        copy!(v.xb0, v.xb) # Xb0 = Xb  CONSIDER BLASCOPY!
-        loss = next_loss
-
-        #calculate the step size μ. Can we use v.xk instead of snpmatrix?
-        println("Gordon 153: size(y) = $(size(y))")
-        print_with_color(:red,"Gordon 153:, k = $k\n")
-        (μ, μ_step) = iht!(v, snpmatrix, y, k, nstep=max_step, iter=mm_iter)
-
-        # iht! gives us an updated x*b. Use it to recompute residuals and gradient
-        v.r .= y .- v.xb
-        v.r[mask_n .== 0] .= 0 #bit masking, idk why we need this yet
-
-        At_mul_B!(v.df, snpmatrix, v.r) # v.df = X'(y - Xβ) Can we use v.xk instead of snpmatrix?
-        print("Gordon 159: size(v.df), size(snpmatrix), size(v.r) = ")
-        println(size(v.df), size(snpmatrix), size(v.r))
-
-        # update loss, objective, gradient, and check objective is not NaN or Inf
-        next_loss = sum(abs2, v.r) / 2
-        !isnan(next_loss) || throw(error("Objective function is NaN, aborting..."))
-        !isinf(next_loss) || throw(error("Objective function is Inf, aborting..."))
-
-        # track convergence
-        the_norm    = chebyshev(v.b, v.b0) #max(abs(x - y))
-        print("Gordon 167: size(v.b), size(v.b0) = ")
-        println(size(v.b), size(v.b0))
-        scaled_norm = the_norm / (norm(v.b0, Inf) + 1)
-        converged   = scaled_norm < tol
-
-        if converged
-            mm_time = toq()   # stop time
-            #PyPlot.boxplot(rand(100,6))
-
-            println("IHT converged in " * string(mm_iter) * " iterations")
-            println("It took " * string(mm_time) * " seconds to converge")
-            println("The estimated model is stored in 'beta'")
-            println("There are " * string(countnz(v.b)) * " non-zero entries of β")
-            found = find(v.b .!= 0.0)
-            println(found)
-            println(v.b[found])
-            return IHTResults(mm_time, next_loss, mm_iter, copy(v.b))
-        end
-
-        if mm_iter == max_iter
-            mm_time = toq() # stop time
-            throw(error("Did not converge!!!!! The run time for IHT was " *
-                string(mm_time) * "seconds"))
-        end
-        print_with_color(:red,"=========== mm_iter LOOP END ====\n")
-    end
-end #function L0_reg
-
-"""
-Calculates the IHT step β+ = P_k(β - μ ∇f(β)).
-Returns step size (μ), and number of times line search was done (μ_step).
-
-This function updates: b, xb, xk, gk, xgk, idx
-"""
-function iht!(
-    v         :: IHTVariable,
-    snpmatrix :: Matrix{Float64},
-    y         :: Vector{Float64},
-    k         :: Int;
-    iter      :: Int = 1,
-    nstep     :: Int = 50,
-)
-    println()
-    print_with_color(:green,"=========== BEGIN iht!() ==============================\n")
-    println("Gordon 202: BEGIN iht!()")
-    # compute indices of nonzeroes in beta and store them in v.idx (also sets size of v.gk)
-    _iht_indices(v, k)
-
-    # fill v.xk, which stores columns of snpmatrix corresponding to non-0's of b
-    println("Gordon 206: ready to broadcast???")
-    v.xk[:, :] .= snpmatrix[:, v.idx]
-    print("Gordon 207: size(v.xk), size(snpmatrix), size(v.idx) = ")
-    println(size(v.xk), size(snpmatrix), size(v.idx))
-
-    # fill v.gk, which store only k largest components of gradient (v.df)
-    # fill_perm!(v.gk, v.df, v.idx)  # gk = g[v.idx]
-    v.gk .= v.df[v.idx]
-    println("Gordon 211: size(v.gk) = $(size(v.gk))")
-
-    # now compute X_k β_k and store result in v.xgk
-    A_mul_B!(v.xgk, v.xk, v.gk)
-    print("Gordon 214: size(v.xgk), size(v.xk), size(v.gk) = ")
-    println(size(v.xgk), size(v.xk), size(v.gk))
-
-    # warn if xgk only contains zeros
-    all(v.xgk .≈ 0.0) && warn("Entire active set has values equal to 0")
-
-    #compute step size and notify if step size too small
-    μ = norm(v.gk, 2)^2 / norm(v.xgk, 2)^2
-    isfinite(μ) || throw(error("Step size is not finite, is active set all zero?"))
-    μ <= eps(typeof(μ)) && warn("Step size $(μ) is below machine precision, algorithm may not converge correctly")
-    println("Gordon 222: before _iht_gradstep, μ = $μ")
-
-    #Take the gradient step and compute ω. Note in order to compute ω, need β^{m+1} and xβ^{m+1} (eq5)
-    _iht_gradstep(v, μ, k)
-    #ω = compute_ω!(v, snpmatrix) #is snpmatrix required? Or can I just use v.x
-    #these next 5 lines temporarily replace the previous line's call to compute_ω()
-        A_mul_B!(v.xb, snpmatrix, v.b)
-        print("Gordon 224: size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0) = ")
-        println(size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0))
-        ω = sqeuclidean(v.b, v.b0) / sqeuclidean(v.xb, v.xb0)
-        println("Gordon 224: ω = $ω")
-    println("Gordon 226: after  _iht_gradstep and compute_ω!(), ω = $ω")
-
-    #compute ω and check if μ < ω. If not, do line search by halving μ and checking again.
-    μ_step = 0
-    for i = 1:nstep
-        #exit loop if μ < ω where c = 0.01 for now
-        if _iht_backtrack(v, ω, μ); break; end
-        println()
-        println("=========== BEGIN BACKTRACK LOOP (i = $i) ===============")
-        #println("Gordon 232: after _iht_backtrack(), i = $i")
-
-        #if μ >= ω, step half and warn if μ falls below machine epsilon
-        μ /= 2
-        μ <= eps(typeof(μ)) && warn("Step size equals zero, algorithm may not converge correctly")
-        println("Gordon 236: μ = $μ")
-
-        # recompute gradient step
-        copy!(v.b, v.b0)
-        _iht_gradstep(v, μ, k)
-
-        # re-compute ω based on xβ^{m+1}
-        A_mul_B!(v.xb, snpmatrix, v.b)
-        #print("Gordon 244: size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0) = ")
-        #println(size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0))
-        ω = sqeuclidean(v.b, v.b0) / sqeuclidean(v.xb, v.xb0)
-        println("Gordon 244: ω = $ω")
-
-
-        μ_step += 1
-        println("=========== END BACKTRACK LOOP =====")
-    end
-    print_with_color(:green,"=========== END iht!() =====\n")
-    return (μ, μ_step)
+    return my_snpweights, my_snpmatrix
 end
