@@ -4,14 +4,13 @@ using IHT
 using DataFrames
 using Distances
 using StatsBase
-#using Plotly
-using PyPlot
-#using StatPlots
-using Plots
+
+#for Gordon
+#using PyPlot
+#using Plots
 using StatPlots
-using BenchmarkTools
-using StandardizedMatrices
-using Distributions
+#using BenchmarkTools
+#using Distributions
 using JLD
 using NPZ
 #export MendelIHT
@@ -137,8 +136,8 @@ function L0_reg(
 
 
     # snpmatrix = use_A2_as_minor_allele(x.snpmatrix) #to compare results with using PLINK
-    snpmatrix = StatsBase.zscore(snpmatrix, 1)  # standardize
-    #snpmatrix = StandardizedMatrix(snpmatrix)  # NEW WAY !!! doesn't work all the way
+    snpmatrix = StatsBase.zscore(snpmatrix, 1)
+
     println("Gordon testing 130,510: Set Intercept here or NOT, and in MendelIHT_utilities.jl")
     println("Note: Set USE_INTERCEPT = false to drop intercept column.")
     USE_INTERCEPT = true
@@ -148,48 +147,32 @@ function L0_reg(
     println("Note: Set USE_WEIGHTS = true to use weights.")
     USE_WEIGHTS = true
     if USE_WEIGHTS
-        #copy!(snpmatrix, my_snpmatrix)  # NEW WAY with WEIGHTS !!!
         my_snpweights, snpmatrix = calculatePriorWeightsforIHT(x,y,k,v)
     end
-    println()
-    println("Gordon 130: size(snpmatrix) = $(size(snpmatrix))")
-    println("Gordon 130: contents of snpmatrix after zscore()")
-    println(snpmatrix[1,1:10])
-    println(snpmatrix[2,1:10])
-    println(snpmatrix[3,1:10])
-    println("\n")
     #
     # Begin IHT calculations
     #
     fill!(v.xb, 0.0) #initialize β = 0 vector, so Xβ = 0
-    println("Gordon 134: size(v.xb) = $(size(v.xb))")
     copy!(v.r, y)    #redisual = y-Xβ = y  CONSIDER BLASCOPY!
     v.r[mask_n .== 0] .= 0 #bit masking? idk why we need this yet
-    println("Gordon 137: size(v.r) = $(size(v.r))")
 
     # calculate the gradient v.df = -X'(y - Xβ) = X'(-1*(Y-Xb)). Future gradient
     # calculations are done in iht!. Note the negative sign will be cancelled afterwards
     # when we do b+ = P_k( b - μ∇f(b)) = P_k( b + μ(-∇f(b))) = P_k( b + μ*v.df)
 
     # Can we use v.xk instead of snpmatrix?
-    println(size(v.df), size(snpmatrix), size(v.r))
-    print("Gordon 143: size(v.df), size(snpmatrix), size(v.r) = ")
     At_mul_B!(v.df, snpmatrix, v.r)
 
     tic()   # duplicate clock here to skip timing debug statements in weight function
 
     for mm_iter = 1:max_iter
-        println()
-        print_with_color(:red,"=========== mm_iter LOOP ==========================================================\n")
-        println("Gordon 145: mm_iter = $mm_iter")
+        print_with_color(:red,"\n=========== mm_iter LOOP (mm_iter = $(mm_iter)) ===================================================\n")
         # save values from previous iterate
         copy!(v.b0, v.b)   # b0 = b   CONSIDER BLASCOPY!
         copy!(v.xb0, v.xb) # Xb0 = Xb  CONSIDER BLASCOPY!
         loss = next_loss
 
         #calculate the step size μ. Can we use v.xk instead of snpmatrix?
-        println("Gordon 153: size(y) = $(size(y))")
-        print_with_color(:red,"Gordon 153:, k = $k\n")
         (μ, μ_step) = iht!(v, snpmatrix, y, k, nstep=max_step, iter=mm_iter)
 
         # iht! gives us an updated x*b. Use it to recompute residuals and gradient
@@ -197,8 +180,6 @@ function L0_reg(
         v.r[mask_n .== 0] .= 0 #bit masking, idk why we need this yet
 
         At_mul_B!(v.df, snpmatrix, v.r) # v.df = X'(y - Xβ) Can we use v.xk instead of snpmatrix?
-        print("Gordon 159: size(v.df), size(snpmatrix), size(v.r) = ")
-        println(size(v.df), size(snpmatrix), size(v.r))
 
         # update loss, objective, gradient, and check objective is not NaN or Inf
         next_loss = sum(abs2, v.r) / 2
@@ -207,14 +188,11 @@ function L0_reg(
 
         # track convergence
         the_norm    = chebyshev(v.b, v.b0) #max(abs(x - y))
-        print("Gordon 167: size(v.b), size(v.b0) = ")
-        println(size(v.b), size(v.b0))
         scaled_norm = the_norm / (norm(v.b0, Inf) + 1)
         converged   = scaled_norm < tol
 
         if converged
             mm_time = toq()   # stop time
-            #PyPlot.boxplot(rand(100,6))
 
             println("IHT converged in " * string(mm_iter) * " iterations")
             println("It took " * string(mm_time) * " seconds to converge")
@@ -249,27 +227,20 @@ function iht!(
     iter      :: Int = 1,
     nstep     :: Int = 50,
 )
-    println()
-    print_with_color(:green,"=========== BEGIN iht!() ==============================\n")
-    println("Gordon 202: BEGIN iht!()")
+    print_with_color(:green,"\n=========== BEGIN iht!() ==============================\n")
     # compute indices of nonzeroes in beta and store them in v.idx (also sets size of v.gk)
     _iht_indices(v, k)
 
     # fill v.xk, which stores columns of snpmatrix corresponding to non-0's of b
     println("Gordon 206: ready to broadcast???")
     v.xk[:, :] .= snpmatrix[:, v.idx]
-    print("Gordon 207: size(v.xk), size(snpmatrix), size(v.idx) = ")
-    println(size(v.xk), size(snpmatrix), size(v.idx))
 
     # fill v.gk, which store only k largest components of gradient (v.df)
     # fill_perm!(v.gk, v.df, v.idx)  # gk = g[v.idx]
     v.gk .= v.df[v.idx]
-    println("Gordon 211: size(v.gk) = $(size(v.gk))")
 
     # now compute X_k β_k and store result in v.xgk
     A_mul_B!(v.xgk, v.xk, v.gk)
-    print("Gordon 214: size(v.xgk), size(v.xk), size(v.gk) = ")
-    println(size(v.xgk), size(v.xk), size(v.gk))
 
     # warn if xgk only contains zeros
     all(v.xgk .≈ 0.0) && warn("Entire active set has values equal to 0")
@@ -278,26 +249,25 @@ function iht!(
     μ = norm(v.gk, 2)^2 / norm(v.xgk, 2)^2
     isfinite(μ) || throw(error("Step size is not finite, is active set all zero?"))
     μ <= eps(typeof(μ)) && warn("Step size $(μ) is below machine precision, algorithm may not converge correctly")
-    println("Gordon 222: before _iht_gradstep, μ = $μ")
+    println("Gordon 222: μ = $(μ), before _iht_gradstep")
 
     #Take the gradient step and compute ω. Note in order to compute ω, need β^{m+1} and xβ^{m+1} (eq5)
     _iht_gradstep(v, μ, k)
     #ω = compute_ω!(v, snpmatrix) #is snpmatrix required? Or can I just use v.x
     #these next 5 lines temporarily replace the previous line's call to compute_ω()
         A_mul_B!(v.xb, snpmatrix, v.b)
-        print("Gordon 224: size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0) = ")
-        println(size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0))
         ω = sqeuclidean(v.b, v.b0) / sqeuclidean(v.xb, v.xb0)
-        println("Gordon 224: ω = $ω")
-    println("Gordon 226: after  _iht_gradstep and compute_ω!(), ω = $ω")
+    println("Gordon 226: μ = $(μ), after _iht_gradstep")
+    println("Gordon 226: ω = $(ω), after  _iht_gradstep and compute_ω!()")
+    print("Gordon 226: size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0) = ")
+    println(size(v.xb), size(snpmatrix), size(v.b), size(v.b0), size(v.xb0))
 
     #compute ω and check if μ < ω. If not, do line search by halving μ and checking again.
     μ_step = 0
     for i = 1:nstep
         #exit loop if μ < ω where c = 0.01 for now
         if _iht_backtrack(v, ω, μ); break; end
-        println()
-        println("=========== BEGIN BACKTRACK LOOP (i = $i) ===============")
+        println("\n=========== BEGIN BACKTRACK LOOP (i = $i) ===============")
         #println("Gordon 232: after _iht_backtrack(), i = $i")
 
         #if μ >= ω, step half and warn if μ falls below machine epsilon
@@ -320,9 +290,11 @@ function iht!(
         μ_step += 1
         println("=========== END BACKTRACK LOOP =====")
     end
+
     print_with_color(:green,"=========== END iht!() =====\n")
     return (μ, μ_step)
 end
+
 """
 Calculates the Prior Weighting for IHT.
 Returns a weight matrix (snpweights)
@@ -381,13 +353,6 @@ function calculatePriorWeightsforIHT(
     println(snpmatrix[3,1:10])
     println(snpmatrix[4,1:10])
     println(snpmatrix[5,1:10])
-    SMz = StandardizedMatrix(snpmatrix)         # WORKS !!!
-    println("\nGordon 130: contents of snpmatrix_ztemp using NEW StandardizedMatrix()")
-    println(SMz[1,1:10])
-    println(SMz[2,1:10])
-    println(SMz[3,1:10])
-    println(SMz[4,1:10])
-    println(SMz[5,1:10])
     snpmatrix_ztemp = StatsBase.zscore(snpmatrix, 1)  # standardize
     println("\nGordon 130: contents of snpmatrix_ztemp after zscore()")
     println(snpmatrix_ztemp[1,1:10])
@@ -459,7 +424,7 @@ function calculatePriorWeightsforIHT(
     # GORDON - CALCUATE CONSTANT WEIGHTS - another weighting option
     my_snpweights_half = copy(my_snpMAF)
     for i = 1:size(my_snpweights_half,2)
-        my_snpweights_half[1,i] = 0.5
+        my_snpweights_half[1,i] = 1.0   # was 0.5
     end
     println(my_snpweights_half[1,1:10])
     println("\ndescribe(my_snpweights_half)")
@@ -515,6 +480,9 @@ function calculatePriorWeightsforIHT(
     println("===============================================================")
     print(DEFAULT)
     # DECIDE NOW WHICH WEIGHTS TO APPLY !!!
+
+    my_snpweights = copy(my_snpweights_half)    # Ben/Kevin this is currently at 1.0 for testing null effect
+    
     my_snpweights = copy(my_snpweights_huazhou_reciprocal)
     println(RED*"SELECT WEIGHT FUNCTION HERE !!!"*DEFAULT)
     println("\ndescribe(my_snpweights)")
@@ -535,14 +503,17 @@ function calculatePriorWeightsforIHT(
     println(my_snpweights[found])
 
     # trim the top too ???
-    cutoff_top = 0.1
-    found_top = find(my_snpMAF .> cutoff_top)    # below 2.5% causes me problems with convergence
-    #println(found_top)
-    #println(my_snpMAF[found_top])
-    println(RED*"Setting weight = 0 for $(size(found_top)) data points with MAF above $(cutoff_top) cutoff."*DEFAULT)
-    my_snpweights[found_top] = 0
-    #println(my_snpweights[found_top])
-
+    TRIM_TOP = 0.1
+    TRIM_TOP = 0.0
+    if TRIM_TOP > 0.0
+        cutoff_top = TRIM_TOP
+        found_top = find(my_snpMAF .> cutoff_top)    # below 2.5% causes me problems with convergence
+        #println(found_top)
+        #println(my_snpMAF[found_top])
+        println(RED*"Setting weight = 0 for $(size(found_top)) data points with MAF above $(cutoff_top) cutoff."*DEFAULT)
+        my_snpweights[found_top] = 0
+        #println(my_snpweights[found_top])
+    end
     println("===============================================================")
     println("============ MAKE GRAPHS OF SELECTED WEIGHT FUNCTION ==========")
     println("===============================================================")
@@ -625,56 +596,16 @@ function calculatePriorWeightsforIHT(
         print()
     end
 
-    println()
-    println("===============================================================")
-    println("===============================================================")
-    println("========== TRY APPLYING THE WEIGHTS BEFORE ZSCORE =============")
-    println("========== BUT ZSCORE BASICALLY ERASED THEM, AS IT SHOULD =====")
-    println("===============================================================")
-
-    println(RED*"HERE I ASSIGN THE WEIGHTS before the zscore !!!"*DEFAULT)
     my_snpmatrix_temp = deepcopy(my_snpmatrix) # protect my_snpmatrix for use below
-    # NEXT LINE APPLIES THE SNPWEIGHTS JUST FINE, BUT THE DON'T STICK THROUGH STANDARDIZE
-    # SO I HAD TO REAPPLY THEM
-    A_mul_B!(my_snpmatrix, my_snpmatrix_temp, my_diagm_snpweights)# put weights on first to keep it sparce
-    println("Here is the first my_snpmatrix with the weights in!!!")
-    println("Gordon testing 130: size(my_snpmatrix) = $(size(my_snpmatrix))")
-    println("Gordon testing 130: size(my_snpmatrix_temp) = $(size(my_snpmatrix_temp))")
-    println("Gordon testing 130: typeof(my_snpmatrix) = $(typeof(my_snpmatrix))")
-    println("Gordon testing 130: typeof(my_snpmatrix_temp) = $(typeof(my_snpmatrix_temp))")
-    println("Gordon testing 130: peek at first 3 rows of my_snpmatrix BEFORE THE WEIGHTS")
-    println(my_snpmatrix_temp[1,1:10])
-    println(my_snpmatrix_temp[2,1:10])
-    println(my_snpmatrix_temp[3,1:10])
-
-    println("===============================================================")
-
-    println("Gordon testing 130: peek at first 3 rows of my_snpmatrix AFTER THE WEIGHTS")
-    println(my_snpmatrix[1,1:10])
-    println(my_snpmatrix[2,1:10])
-    println(my_snpmatrix[3,1:10])
-
-    println("===============================================================")
-    println("===============================================================")
-    println("========== NOW APPLY THE ZSCORE TO WEIGHTED SNPMATRIX =======")
-    println("===============================================================")
-    my_snpmatrix = StatsBase.zscore(my_snpmatrix, 1)    # standardize
-
-    println("===============================================================")
-    println("===============================================================")
-    println("========== NOW APPLY THE ZSCORE TO UNWEIGHTED SNPMATRIX =======")
-    println("===============================================================")
-    println(RED*"USE NEXT LINE TO DISABLE WEIGHTS from above !!!"*DEFAULT)
-    USE_StandardizedMatrix = false
-    if USE_StandardizedMatrix  # didn't work with A_mul_B!(), try again later???
-        my_snpmatrix = StandardizedMatrix(my_snpmatrix_temp)     # NEW WAY !!! THIS LINE IS GOOD, BUT I MOVED IT DOWN A PAGE
-    else
-        my_snpmatrix = StatsBase.zscore(my_snpmatrix_temp, 1)    # USE THIS LINE TO DISABLE WEIGHTS from above !!!
-    end
     #copy!(my_snpmatrix_temp, my_snpmatrix)
 
     println("===============================================================")
+    println("===============================================================")
+    println("========== NOW APPLY THE ZSCORE TO SNPMATRIX ==================")
+    println("===============================================================")
+    my_snpmatrix = StatsBase.zscore(my_snpmatrix, 1)
 
+    println("===============================================================")
     println("Gordon testing 130: peek at first 3 rows of my_snpmatrix AFTER ZSCORE BUT BEFORE THE WEIGHTS")
     println(my_snpmatrix[1,1:10])
     println(my_snpmatrix[2,1:10])
@@ -694,18 +625,13 @@ function calculatePriorWeightsforIHT(
 
 
     println("===============================================================")
-
     println("Gordon testing 130: peek at first 3 rows of my_snpmatrix AFTER ZSCORE AND AFTER THE WEIGHTS")
     println(my_snpmatrix[1,1:10])
     println(my_snpmatrix[2,1:10])
     println(my_snpmatrix[3,1:10])
     println("Gordon testing 130: describe(my_snpmatrix[:,2]) after zscore() and after the weights")
     describe(my_snpmatrix[:,2])
-    # NEXT LINE ENEDED UP CAUSING INDEX AND BROADCAST ERRORS LIKE my_snpmatrix[1,:]=5 AND v.xk[:, :] .= snpmatrix[:, v.idx]
-    # PLUS I'M NOT SURE IT HELPED ANYWAY, SO GO BACK TO OLD STANDARIZE FUNCTION
-    # *** turns out the problem was NaN's in my_snpmatrix so this StandardizedMatrix call could be good after all
-    # *** but won't it be broken after we add the column of 1's  for Intercept ???
-    #my_snpmatrix = StandardizedMatrix(my_snpmatrix)     # NEW WAY !!! THIS LINE IS GOOD, BUT I MOVED IT DOWN A PAGE
+
     println("===============================================================")
     println("========== CONSIDER DROPPING THE INTERCEPT ====================")
     println("========== TO KEEP THE MATRIX SPARSER =========================")
@@ -720,7 +646,7 @@ function calculatePriorWeightsforIHT(
     println("===============================================================")
     println("========== SETUP TEST DATA HERE ===============================")
     println("===============================================================")
-    println(RED*"SETUP after zscore TEST DATA HERE !!! "*DEFAULT)
+    println(RED*"SETUP optional 'after zscore' TEST DATA HERE !!! "*DEFAULT)
     TEST_DATA = [3,5]
     if 1 in TEST_DATA           # Note: Designed for use when weights are OFF
                                 #       this test data DID crash the program at 26 iterations with a dimensions error
@@ -739,11 +665,12 @@ function calculatePriorWeightsforIHT(
         println("\n")
     end
 
-
+    println()
     println("===============================================================")
     println("===============================================================")
     println("========== MAKE MANUAL ADJUSTMENTS IN SNPMATRIX HERE ==========")
     println("===============================================================")
+    println(RED*"SETUP optional 'manual adjustments' TEST DATA HERE !!! "*DEFAULT)
 
     if 2 in TEST_DATA           # special - outlier DROP for 2√pq .\ 1
         println(RED*"LOOK FOR INTERESTING DATA HERE !!! "*DEFAULT)
@@ -796,10 +723,10 @@ function calculatePriorWeightsforIHT(
     println(size(v.df), size(my_snpmatrix), size(v.r))
     At_mul_B!(v.df, my_snpmatrix, v.r)
     =#
+    println()
     println("===============================================================")
     println("===============================================================")
-    println("===============================================================")
-    println("===============================================================")
+    println("========== PRIOR WEIGHTS - END CALCULATIONS ===================")
     println("===============================================================")
     println("===============================================================")
     println("===============================================================")
